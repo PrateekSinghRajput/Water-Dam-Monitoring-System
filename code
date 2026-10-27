@@ -1,1 +1,557 @@
-//
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+
+// --- Mobile Hotspot Credentials ---
+- const charWIFI_SSID = 
+"xxxx";
+- const charWIFI_PASS = 
+"xxxx";
+
+// --- Pin Definitions (Matches Your Hardware Setup) ---
+#define TRIG_PIN 26
+#define ECHO_PIN 27
+#define FLOAT_PIN 25      // Float switch connected between GPIO 25 and GND
+#define BUZZER_PIN 14
+#define GSM_RX 16         // ESP32 RX2 -> Connect to GSM TX
+#define GSM_TX 17         // ESP32 TX2 -> Connect to GSM RX
+
+// --- Peripherals & Instances ---
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+HardwareSerial gsmSerial(2);
+WebServer server(80);
+Preferences preferences;
+
+// --- Persistent Settings (Loaded from EEPROM/Flash) ---
+String targetPhone = "+91xxxxxxxxxx";
+int damDepthCm = 100;
+int thresholdLevel = 80;
+
+// --- Live Telemetry & State Variables ---
+float currentDistanceCm = 100.0;
+int currentLevelPct = 0;
+bool floatTriggered = false;
+bool isCritical = false;
+bool smsSent = false;
+int gsmSignal = 0;
+
+unsigned long lastCheckTime = 0;
+unsigned long lastGsmPoll = 0;
+unsigned long lastBuzzerToggle = 0;
+bool buzzerState = false;
+
+// --- Embedded HTML/CSS/JS GUI Dashboard ---
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 Dam Monitoring GUI</title>
+<style>
+  :root {
+    --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8;
+    --safe: #10b981; --warn: #f59e0b; --danger: #ef4444; --water: #0284c7;
+  }
+- { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
+  body { background: var(--bg); color: var(--text); padding: 16px; max-width: 950px; margin: auto; }
+  header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 12px; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }
+  .title-blk h1 { font-size: 1.4rem; letter-spacing: 0.5px; }
+  .title-blk p { font-size: 0.85rem; color: var(--muted); }
+  .badge { padding: 6px 14px; border-radius: 999px; font-weight: 700; font-size: 0.85rem; background: var(--safe); color: #fff; }
+  .grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 20px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border-radius: 14px; padding: 20px; border: 1px solid #334155; box-shadow: 0 8px 20px rgba(0,0,0,0.3); }
+  .card h2 { font-size: 1.05rem; color: #38bdf8; margin-bottom: 14px; text-transform: uppercase; letter-spacing: 0.8px; }
+  
+  /* Dam Graphic Visualizer */
+  .dam-stage { position: relative; height: 320px; background: #090d16; border-radius: 12px; overflow: hidden; border: 2px solid #475569; }
+  .sensor-bridge { position: absolute; top: 0; left: 50%; transform: translateX(-50%); background: #334155; padding: 6px 16px; border-radius: 0 0 10px 10px; font-size: 0.75rem; font-weight: 700; z-index: 6; border: 1px solid #64748b; color: #38bdf8; }
+  .sonic-cone { position: absolute; top: 28px; left: 50%; transform: translateX(-50%); width: 0; height: 0; border-left: 35px solid transparent; border-right: 35px solid transparent; border-bottom: 290px solid rgba(56, 189, 248, 0.08); z-index: 2; pointer-events: none; }
+  
+  /* Concrete Dam Walls */
+  .wall-left { position: absolute; left: 0; bottom: 0; width: 32px; height: 270px; background: linear-gradient(90deg, #475569, #64748b); z-index: 4; border-right: 2px solid #94a3b8; }
+  .wall-right { position: absolute; right: 0; bottom: 0; width: 45px; height: 270px; background: linear-gradient(90deg, #64748b, #475569); z-index: 4; border-left: 2px solid #94a3b8; }
+  
+  /* Float Sensor on Dam Side */
+  .float-mount { position: absolute; right: 45px; top: 65px; z-index: 7; display: flex; align-items: center; }
+  .float-arm { width: 22px; height: 4px; background: #cbd5e1; }
+  .float-bob { width: 20px; height: 20px; border-radius: 50%; background: var(--safe); border: 2px solid #fff; transition: 0.3s; box-shadow: 0 0 8px var(--safe); }
+  .float-tag { position: absolute; right: 75px; top: 62px; z-index: 7; font-size: 0.75rem; background: rgba(15,23,42,0.85); padding: 3px 8px; border-radius: 4px; border: 1px solid #475569; white-space: nowrap; }
+  
+  /* Threshold Line */
+  .thresh-line { position: absolute; left: 32px; right: 45px; border-top: 2px dashed rgba(245, 158, 11, 0.75); z-index: 5; font-size: 0.7rem; color: var(--warn); padding-left: 6px; pointer-events: none; transition: bottom 0.4s; }
+
+  /* Rising Water Animation */
+  .water-body { position: absolute; bottom: 0; left: 32px; right: 45px; height: 0%; background: linear-gradient(180deg, rgba(56,189,248,0.85) 0%, rgba(2,132,199,0.95) 100%); transition: height 0.5s ease; z-index: 3; border-top: 3px solid #bae6fd; }
+  .water-pct { position: absolute; width: 100%; text-align: center; bottom: 45%; z-index: 8; font-size: 2.3rem; font-weight: 800; text-shadow: 0 2px 10px rgba(0,0,0,0.85); }
+
+  /* Telemetry Cards */
+  .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+  .m-box { background: #0f172a; padding: 10px 12px; border-radius: 8px; border: 1px solid #334155; }
+  .m-label { font-size: 0.75rem; color: var(--muted); }
+  .m-val { font-size: 1.15rem; font-weight: 700; margin-top: 3px; }
+
+  /* EEPROM Settings Form */
+  .form-group { margin-bottom: 14px; }
+  label { display: block; font-size: 0.82rem; color: var(--muted); margin-bottom: 5px; }
+  input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #fff; font-size: 0.95rem; }
+  button { width: 100%; padding: 12px; border-radius: 8px; border: none; background: #0284c7; color: #fff; font-weight: 700; font-size: 0.95rem; cursor: pointer; transition: 0.2s; margin-top: 4px; }
+  button:hover { background: #0369a1; }
+  .toast { margin-top: 10px; font-size: 0.85rem; text-align: center; color: var(--safe); display: none; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="title-blk">
+      <h1>DAM MONITORING & CONTROL GUI</h1>
+      <p>Real-Time Ultrasonic, Side Float Switch & GSM Alert System</p>
+    </div>
+    <div id="sysBadge" class="badge">SYSTEM SAFE</div>
+  </header>
+
+  <div class="grid">
+    <!-- Left Column: Visual Dam Graphic -->
+    <div class="card">
+      <h2>Live Dam Cross-Section</h2>
+      <div class="dam-stage">
+        <div class="sensor-bridge">HC-SR04 ULTRASONIC</div>
+        <div class="sonic-cone"></div>
+        <div class="wall-left"></div>
+        <div class="wall-right"></div>
+
+        <div class="float-tag" id="floatTag">Float Sensor: SAFE</div>
+        <div class="float-mount">
+          <div class="float-bob" id="floatBob"></div>
+          <div class="float-arm"></div>
+        </div>
+
+        <div class="thresh-line" id="threshLine" style="bottom: 80%;">Threshold (80%)</div>
+        <div class="water-pct" id="waterPctTxt">0%</div>
+        <div class="water-body" id="waterFill"></div>
+      </div>
+
+      <div class="metrics">
+        <div class="m-box">
+          <div class="m-label">Ultrasonic Distance</div>
+          <div class="m-val" id="distTxt">-- cm</div>
+        </div>
+        <div class="m-box">
+          <div class="m-label">Side Float Switch</div>
+          <div class="m-val" id="floatTxt">SAFE (OPEN)</div>
+        </div>
+        <div class="m-box">
+          <div class="m-label">GSM Signal Strength</div>
+          <div class="m-val" id="gsmTxt">-- %</div>
+        </div>
+        <div class="m-box">
+          <div class="m-label">SMS Alert Lock</div>
+          <div class="m-val" id="smsTxt">READY</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Column: EEPROM Configuration -->
+    <div class="card">
+      <h2>EEPROM Saved Configuration</h2>
+      <form id="cfgForm" onsubmit="saveSettings(event)">
+        <div class="form-group">
+          <label>GSM Alert Mobile Number (with Country Code)</label>
+          <input type="text" id="phoneInput" placeholder="+919975617490" required>
+        </div>
+        <div class="form-group">
+          <label>Total Dam Depth (Sensor to Floor in cm)</label>
+          <input type="number" id="depthInput" min="10" max="500" required>
+        </div>
+        <div class="form-group">
+          <label>Warning Level Threshold (%)</label>
+          <input type="number" id="threshInput" min="5" max="100" required>
+        </div>
+        <button type="submit">Save to ESP32 EEPROM</button>
+        <div id="saveToast" class="toast">Saved to EEPROM! Persists after power-off.</div>
+      </form>
+
+      <div style="margin-top: 22px; padding-top: 14px; border-top: 1px solid #334155; font-size: 0.82rem; color: var(--muted); line-height: 1.5;">
+        <strong style="color: #e2e8f0;">Hardware Trigger Rules:</strong><br>
+- <b>Single SMS Trigger:</b> Dispatches 1 SMS to the EEPROM-saved phone number strictly when the Float Sensor becomes <b>HIGH (CROSSED)</b>.<br>
+- <b>Auto-Reset:</b> Rearms SMS lock automatically once the float switch drops back to normal.
+      </div>
+    </div>
+  </div>
+
+<script>
+  let formInitialized = false;
+
+  async function pollTelemetry() {
+    try {
+      const res = await fetch('/api/status');
+      const d = await res.json();
+
+      // Update Water Level Graphic
+      document.getElementById('waterFill').style.height = (d.level * 0.84) + '%';
+      document.getElementById('waterPctTxt').innerText = d.level + '%';
+      document.getElementById('distTxt').innerText = d.distance.toFixed(1) + ' cm';
+      document.getElementById('gsmTxt').innerText = d.gsmPct + '% (CSQ:' + d.csq + ')';
+      document.getElementById('smsTxt').innerText = d.smsSent ? 'SENT (LOCKED)' : 'ARMED';
+
+      // Update Threshold Line
+      const tLine = document.getElementById('threshLine');
+      tLine.style.bottom = (d.threshold * 0.84) + '%';
+      tLine.innerText = 'Threshold (' + d.threshold + '%)';
+
+      // Update Float Switch Graphic on Dam Side
+      const bob = document.getElementById('floatBob');
+      const fTag = document.getElementById('floatTag');
+      const fTxt = document.getElementById('floatTxt');
+      if (d.floatTrig) {
+        bob.style.background = 'var(--danger)';
+        bob.style.boxShadow = '0 0 14px var(--danger)';
+        fTag.innerText = 'Float: HIGH (CROSSED!)';
+        fTag.style.borderColor = 'var(--danger)';
+        fTxt.innerText = 'CROSSED (HIGH)';
+        fTxt.style.color = 'var(--danger)';
+      } else {
+        bob.style.background = 'var(--safe)';
+        bob.style.boxShadow = '0 0 8px var(--safe)';
+        fTag.innerText = 'Float: SAFE';
+        fTag.style.borderColor = '#475569';
+        fTxt.innerText = 'SAFE (LOW)';
+        fTxt.style.color = 'var(--safe)';
+      }
+
+      // Update System Status Badge
+      const badge = document.getElementById('sysBadge');
+      if (d.critical) {
+        badge.style.background = 'var(--danger)';
+        badge.innerText = 'CRITICAL ALERT!';
+      } else {
+        badge.style.background = 'var(--safe)';
+        badge.innerText = 'SYSTEM SAFE';
+      }
+
+      // Populate EEPROM values into form once on page load
+      if (!formInitialized) {
+        document.getElementById('phoneInput').value = d.phone;
+        document.getElementById('depthInput').value = d.depth;
+        document.getElementById('threshInput').value = d.threshold;
+        formInitialized = true;
+      }
+    } catch (e) {
+      console.error('Telemetry fetch error:', e);
+    }
+  }
+
+  async function saveSettings(e) {
+    e.preventDefault();
+    const params = new URLSearchParams();
+    params.append('phone', document.getElementById('phoneInput').value.trim());
+    params.append('depth', document.getElementById('depthInput').value);
+    params.append('threshold', document.getElementById('threshInput').value);
+
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+
+    if (res.ok) {
+      const toast = document.getElementById('saveToast');
+      toast.style.display = 'block';
+      setTimeout(() => { toast.style.display = 'none'; }, 3500);
+      pollTelemetry();
+    }
+  }
+
+  setInterval(pollTelemetry, 1000);
+  pollTelemetry();
+</script>
+</body>
+</html>
+)rawliteral";
+
+// Function Prototypes
+float getDistanceCM();
+int getGsmSignalStrength();
+void sendSMS(const char* phone, const char* message);
+void updateDisplay(int levelPct, bool floatTrig, bool dangerState, int csq);
+void setupWebServer();
+
+void setup() {
+  Serial.begin(115200);
+  gsmSerial.begin(9600, SERIAL_8N1, GSM_RX, GSM_TX);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(FLOAT_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // 1. Load Saved Settings from ESP32 Flash EEPROM (Namespace: "dam_cfg")
+  preferences.begin("dam_cfg", false);
+  targetPhone = preferences.getString("phone", "+919975617490");
+  damDepthCm = preferences.getInt("depth", 100);
+  thresholdLevel = preferences.getInt("thresh", 80);
+
+  Serial.println("--- EEPROM Loaded Settings ---");
+  Serial.println("Target Phone: " + targetPhone);
+  Serial.printf("Dam Depth: %d cm | Threshold: %d%%\n", damDepthCm, thresholdLevel);
+
+  // 2. Initialize 16x2 LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("CONNECTING WIFI");
+  lcd.setCursor(0, 1);
+  lcd.print(WIFI_SSID);
+
+  // 3. Connect to Mobile Hotspot
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long wifiStart = millis();
+-   while (WiFi.status() != WL_CONNECTED && millis()wifiStart < 
+15000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  lcd.clear();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected! Dashboard IP: " + WiFi.localIP().toString());
+    lcd.setCursor(0, 0);
+    lcd.print("GUI IP ADDRESS:");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP().toString());
+    delay(4000); // Show IP on LCD for 4 seconds so you can open it on your phone
+  } else {
+    Serial.println("\nHotspot timeout. Running offline monitoring.");
+    lcd.setCursor(0, 0);
+    lcd.print("WIFI TIMEOUT!");
+    lcd.setCursor(0, 1);
+    lcd.print("Offline Mode ON");
+    delay(2000);
+  }
+
+  // 4. Start Web Dashboard Server
+  setupWebServer();
+
+  // 5. Initialize GSM Module
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("DAM MONITOR INIT");
+  lcd.setCursor(0, 1);
+  lcd.print("Wait for GSM...");
+
+  delay(2500);
+  gsmSerial.println("AT");
+  delay(500);
+  gsmSerial.println("AT+CMGF=1"); // Set SMS to Text Mode
+  delay(500);
+
+  gsmSignal = getGsmSignalStrength();
+  lcd.clear();
+}
+
+void loop() {
+  // Handle incoming web dashboard requests
+  server.handleClient();
+
+  unsigned long currentMillis = millis();
+
+  // 1. Poll GSM Signal Strength every 10 seconds
+  if (currentMillis - lastGsmPoll >= 10000) {
+    lastGsmPoll = currentMillis;
+    gsmSignal = getGsmSignalStrength();
+  }
+
+  // 2. Read Sensors & Evaluate Dam State every 500ms
+  if (currentMillis - lastCheckTime >= 500) {
+    lastCheckTime = currentMillis;
+
+    currentDistanceCm = getDistanceCM();
+
+    // Convert distance from top sensor into water fill percentage
+    float waterHeight = damDepthCm - currentDistanceCm;
+    if (waterHeight < 0) waterHeight = 0;
+    if (waterHeight > damDepthCm) waterHeight = damDepthCm;
+-     currentLevelPct = (int)((waterHeight / (float)damDepthCm)
+100.0);
+
+    // Read Float Sensor (LOW = water crossed float switch)
+    floatTriggered = (digitalRead(FLOAT_PIN) == LOW);
+
+    // Evaluate Overall Alert Condition (Threshold OR Float Switch)
+    isCritical = (currentLevelPct >= thresholdLevel) || floatTriggered;
+
+    // SMS Logic: Send SMS ONLY ONCE strictly when Float Sensor is triggered
+    if (floatTriggered) {
+      if (!smsSent) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("FLOAT CROSSED!");
+        lcd.setCursor(0, 1);
+        lcd.print("Sending SMS...");
+
+        char alertMsg[140];
+        snprintf(alertMsg, sizeof(alertMsg),
+                 "DAM ALERT: Water crossed the Float Sensor! Current Level: %d%% (Depth: %.1fcm). Immediate action required.",
+                 currentLevelPct, damDepthCm - currentDistanceCm);
+
+        sendSMS(targetPhone.c_str(), alertMsg);
+        smsSent = true; // Lock SMS so it only sends once
+        lcd.clear();
+      }
+    } else {
+      // Reset SMS lock when water drops back below the float switch
+      smsSent = false;
+    }
+
+    // Turn off buzzer if neither float nor threshold is critical
+    if (!isCritical) {
+      digitalWrite(BUZZER_PIN, LOW);
+      buzzerState = false;
+    }
+
+    updateDisplay(currentLevelPct, floatTriggered, isCritical, gsmSignal);
+  }
+
+  // 3. Non-blocking Buzzer Pulsing during Critical Alert
+  if (isCritical) {
+    if (currentMillis - lastBuzzerToggle >= 250) {
+      lastBuzzerToggle = currentMillis;
+      buzzerState = !buzzerState;
+      digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+    }
+  }
+}
+
+// --- Web Server API Endpoints ---
+void setupWebServer() {
+  // Serve Main GUI Page
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html", INDEX_HTML);
+  });
+
+  // Serve Live JSON Telemetry
+  server.on("/api/status", HTTP_GET, []() {
+    int sigPct = (gsmSignal > 0 && gsmSignal <= 31) ? map(gsmSignal, 0, 31, 0, 100) : 0;
+    String json = "{";
+    json += "\"level\":" + String(currentLevelPct) + ",";
+    json += "\"distance\":" + String(currentDistanceCm, 1) + ",";
+    json += "\"floatTrig\":" + String(floatTriggered ? "true" : "false") + ",";
+    json += "\"critical\":" + String(isCritical ? "true" : "false") + ",";
+    json += "\"smsSent\":" + String(smsSent ? "true" : "false") + ",";
+    json += "\"csq\":" + String(gsmSignal) + ",";
+    json += "\"gsmPct\":" + String(sigPct) + ",";
+    json += "\"phone\":\"" + targetPhone + "\",";
+    json += "\"depth\":" + String(damDepthCm) + ",";
+    json += "\"threshold\":" + String(thresholdLevel);
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  // Save Updated Settings to ESP32 Flash EEPROM
+  server.on("/api/settings", HTTP_POST, []() {
+    if (server.hasArg("phone")) {
+      targetPhone = server.arg("phone");
+      preferences.putString("phone", targetPhone);
+    }
+    if (server.hasArg("depth")) {
+      int d = server.arg("depth").toInt();
+      if (d >= 10 && d <= 500) {
+        damDepthCm = d;
+        preferences.putInt("depth", damDepthCm);
+      }
+    }
+    if (server.hasArg("threshold")) {
+      int t = server.arg("threshold").toInt();
+      if (t >= 5 && t <= 100) {
+        thresholdLevel = t;
+        preferences.putInt("thresh", thresholdLevel);
+      }
+    }
+    Serial.println("EEPROM Updated -> Phone: " + targetPhone + " | Depth: " + String(damDepthCm) + "cm | Thresh: " + String(thresholdLevel) + "%");
+    server.send(200, "application/json", "{\"status\":\"saved\"}");
+  });
+
+  server.begin();
+}
+
+// --- Ultrasonic Sensor Read ---
+float getDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration == 0) {
+    return damDepthCm;
+  }
+  return (duration * 0.0343) / 2.0;
+}
+
+// --- GSM Signal Parser (AT+CSQ) ---
+int getGsmSignalStrength() {
+  while (gsmSerial.available()) gsmSerial.read();
+
+  gsmSerial.println("AT+CSQ");
+  unsigned long start = millis();
+  String response = "";
+
+-   while (millis()start < 
+1000) {
+    while (gsmSerial.available()) {
+      char c = gsmSerial.read();
+      response += c;
+    }
+  }
+
+  int idx = response.indexOf("+CSQ:");
+  if (idx != -1) {
+    int commaIdx = response.indexOf(",", idx);
+    if (commaIdx != -1) {
+      String rssiStr = response.substring(idx + 5, commaIdx);
+      rssiStr.trim();
+      int rssi = rssiStr.toInt();
+      if (rssi == 99) return 0;
+      return rssi;
+    }
+  }
+  return 0;
+}
+
+// --- GSM SMS Transmission ---
+void sendSMS(const char* phone, const char* message) {
+  gsmSerial.println("AT+CMGF=1");
+  delay(500);
+  gsmSerial.print("AT+CMGS=\"");
+  gsmSerial.print(phone);
+  gsmSerial.println("\"");
+  delay(1000);
+  gsmSerial.print(message);
+  delay(200);
+  gsmSerial.write(26); // ASCII CTRL+Z
+  delay(3000);
+  Serial.print("Alert SMS Dispatched to: ");
+  Serial.println(phone);
+}
+
+// --- 16x2 LCD Formatter ---
+void updateDisplay(int levelPct, bool floatTrig, bool dangerState, int csq) {
+  int sigPct = (csq > 0 && csq <= 31) ? map(csq, 0, 31, 0, 100) : 0;
+
+  char row0[17];
+  snprintf(row0, sizeof(row0), "Lvl:%3d%% Sig:%2d%%", levelPct, sigPct);
+  lcd.setCursor(0, 0);
+  lcd.print(row0);
+
+  char row1[17];
+  snprintf(row1, sizeof(row1), "Flt:%s St:%s",
+           floatTrig ? "HI " : "OK ",
+           dangerState ? "ALRT!" : "SAFE ");
+  lcd.setCursor(0, 1);
+  lcd.print(row1);
+} 
